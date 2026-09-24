@@ -1,0 +1,138 @@
+name: A31 Preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - bpf-5.10-backport
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout A31
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Show runner resources
+        shell: bash
+        run: |
+          set -e
+          echo "=== CPU ==="
+          nproc
+
+          echo "=== MEMORY ==="
+          free -h
+
+          echo "=== DISK ==="
+          df -h /
+
+          echo "=== REPOSITORY SIZE ==="
+          du -sh . || true
+
+      - name: Install kernel build and image tools
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            device-tree-compiler \
+            flex \
+            git \
+            libelf-dev \
+            libssl-dev \
+            lz4 \
+            ncurses-dev \
+            pahole \
+            python3 \
+            python3-pip \
+            unzip \
+            wget \
+            xz-utils \
+            zip \
+            zstd
+
+      - name: Verify core tools
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== TOOL VERSIONS ==="
+
+          git --version
+          gcc --version | head -n 1
+          make --version | head -n 1
+          python3 --version
+          dtc --version
+          lz4 --version | head -n 1
+          pahole --version
+
+      - name: Inspect A31 kernel
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== KERNEL VERSION ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile
+
+          echo "=== ARCH ==="
+          test -d arch/arm64
+          echo "arm64 source: OK"
+
+          echo "=== BPF ==="
+          test -d kernel/bpf
+          find kernel/bpf -maxdepth 1 -type f | sort | head -n 20
+
+          echo "=== DTS ==="
+          find arch/arm64/boot/dts -type f \
+            \( -name '*.dts' -o -name '*.dtsi' \) \
+            | wc -l
+
+      - name: Save preflight report
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p ci-report
+
+          {
+            echo "A31 PRELIGHT REPORT"
+            echo "==================="
+            echo
+            echo "Commit:"
+            git rev-parse HEAD
+            echo
+            echo "Branch:"
+            git branch --show-current
+            echo
+            echo "Kernel:"
+            grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile
+            echo
+            echo "BPF files:"
+            find kernel/bpf -maxdepth 1 -type f | sort
+            echo
+            echo "Disk:"
+            df -h /
+            echo
+            echo "Memory:"
+            free -h
+          } > ci-report/preflight.txt
+
+      - name: Upload preflight report
+        uses: actions/upload-artifact@v7
+        with:
+          name: a31-preflight-report
+          path: ci-report/preflight.txt
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 7
