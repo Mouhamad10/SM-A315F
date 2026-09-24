@@ -1,0 +1,90 @@
+name: A31 Kernel Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - bpf-5.10-backport
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout A31
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            flex \
+            libelf-dev \
+            libssl-dev \
+            lz4 \
+            ncurses-dev \
+            pahole \
+            python3 \
+            unzip \
+            wget \
+            xz-utils \
+            zip \
+            zstd
+
+      - name: Show source identity
+        shell: bash
+        run: |
+          set -e
+          echo "COMMIT=$(git rev-parse HEAD)"
+          echo "BRANCH=$(git branch --show-current)"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)' Makefile
+
+      - name: Locate A31 build configuration
+        shell: bash
+        run: |
+          set -e
+
+          echo "Possible A31 configs:"
+          find arch/arm64/configs \
+            -maxdepth 2 \
+            -type f \
+            | grep -Ei 'a31|a315|mt6768|exynos|samsung' \
+            | sort || true
+
+      - name: Build kernel
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p out
+
+          export ARCH=arm64
+
+          echo "Available arm64 configs:"
+          ls -1 arch/arm64/configs | head -n 100
+
+          echo
+          echo "Build configuration must be selected from the actual A31 tree."
+          echo "The workflow stops here until the correct Samsung A31 defconfig is verified."
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: a31-build-diagnostics
+          path: |
+            out/
+          if-no-files-found: warn
+          retention-days: 7
