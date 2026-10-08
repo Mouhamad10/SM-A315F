@@ -1,0 +1,354 @@
+name: A31 Kernel — OpenELA + BPF 5.15
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_openola:
+        description: 'Apply OpenELA patches (4.14.186 → 4.14.357)'
+        required: true
+        default: 'true'
+        type: boolean
+      apply_bpf:
+        description: 'Apply BPF 5.15 backport patches'
+        required: true
+        default: 'true'
+        type: boolean
+      skip_failed:
+        description: 'Skip failed patches and continue build'
+        required: true
+        default: 'true'
+        type: boolean
+
+env:
+  A31_REPO: https://github.com/SN-Abdullah-Al-Noman/SM-A315F
+  A32_REPO: https://github.com/stardustps/kernel_samsung_mt6768-lucreticus
+  CLANG_URL: https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20220602-release/Clang-14.0.6-20220602.tar.gz
+  ARCH: arm64
+  SUBARCH: arm64
+
+jobs:
+  patch-and-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+    # ─────────────────────────────────────────────
+    # 1. DEPENDENCIES
+    # ─────────────────────────────────────────────
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+          git bc bison flex libssl-dev make libelf-dev \
+          libdwarf-dev python3 python3-pip zip unzip curl wget \
+          build-essential libncurses5-dev aarch64-linux-gnu-gcc \
+          gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu \
+          cpio kmod lzop
+
+    # ─────────────────────────────────────────────
+    # 2. TOOLCHAIN — ZyC Clang 14
+    # ─────────────────────────────────────────────
+    - name: Setup ZyC Clang 14
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/toolchain
+        echo "Downloading ZyC Clang 14..."
+        wget -q "${{ env.CLANG_URL }}" -O clang.tar.gz
+        tar -xzf clang.tar.gz -C $GITHUB_WORKSPACE/toolchain
+        rm clang.tar.gz
+        echo "CLANG_PATH=$GITHUB_WORKSPACE/toolchain/bin" >> $GITHUB_ENV
+        $GITHUB_WORKSPACE/toolchain/bin/clang --version
+
+    # ─────────────────────────────────────────────
+    # 3. CLONE REPOS
+    # ─────────────────────────────────────────────
+    - name: Clone A31 kernel source
+      run: |
+        git clone --depth=500 ${{ env.A31_REPO }} kernel-a31
+        cd kernel-a31
+        echo "A31 HEAD: $(git log --oneline -1)"
+        echo "A31_BASE=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+    - name: Clone A32 lucreticus source
+      run: |
+        git clone ${{ env.A32_REPO }} kernel-a32
+        cd kernel-a32
+        echo "A32 HEAD: $(git log --oneline -1)"
+        echo "Total commits: $(git rev-list --count HEAD)"
+
+    # ─────────────────────────────────────────────
+    # 4. ANALYZE A32 COMMITS
+    # ─────────────────────────────────────────────
+    - name: Analyze A32 commit history
+      run: |
+        cd kernel-a32
+        mkdir -p $GITHUB_WORKSPACE/patches/openola
+        mkdir -p $GITHUB_WORKSPACE/patches/bpf
+
+        git log --oneline > $GITHUB_WORKSPACE/all_commits_a32.txt
+        echo "Total A32 commits: $(wc -l < $GITHUB_WORKSPACE/all_commits_a32.txt)"
+
+        BASE=$(git log --oneline | grep -iE "4\.14\.186|initial import|a32.*base|samsung.*base" | head -1 | awk '{print $1}')
+        if [ -z "$BASE" ]; then
+          BASE=$(git log --oneline | tail -20 | head -1 | awk '{print $1}')
+        fi
+        echo "A32_BASE_COMMIT=$BASE" >> $GITHUB_ENV
+        echo "A32 base commit: $BASE"
+
+        git log --oneline ${BASE}..HEAD > $GITHUB_WORKSPACE/new_commits.txt
+        echo "New commits to process: $(wc -l < $GITHUB_WORKSPACE/new_commits.txt)"
+        cat $GITHUB_WORKSPACE/new_commits.txt
+
+    - name: Categorize and extract patches
+      run: |
+        cd kernel-a32
+
+        extract_patches() {
+          local list_file=$1
+          local out_dir=$2
+          local n=0
+          while IFS= read -r line; do
+            local hash=$(echo "$line" | awk '{print $1}')
+            local msg=$(echo "$line" | cut -d' ' -f2-)
+            local safe=$(echo "$msg" | tr '/:*?"<>| ' '_' | head -c 60)
+            n=$((n+1))
+            local fname=$(printf "%04d_%s_%s.patch" $n $hash $safe)
+            git format-patch -1 "$hash" --stdout > "$out_dir/$fname" 2>/dev/null && \
+              echo "Extracted: $fname" || echo "WARN: failed to extract $hash"
+          done < "$list_file"
+          echo "Total extracted: $n patches to $out_dir"
+        }
+
+        # ── OpenELA ──
+        if [ "${{ inputs.apply_openola }}" = "true" ]; then
+          grep -E "4\.14\.[2-9][0-9]{2}|openela|stable.*4\.14|Linux 4\.14\.[1-9]" \
+            $GITHUB_WORKSPACE/new_commits.txt > $GITHUB_WORKSPACE/openola_list.txt || true
+          grep -vE "bpf|ebpf|5\.15" $GITHUB_WORKSPACE/new_commits.txt | \
+            grep -E "mm:|fs:|sched:|time:|net:|ipc:|kernel:" \
+            >> $GITHUB_WORKSPACE/openola_list.txt || true
+          sort -u $GITHUB_WORKSPACE/openola_list.txt -o $GITHUB_WORKSPACE/openola_list.txt
+          echo "OpenELA commits: $(wc -l < $GITHUB_WORKSPACE/openola_list.txt)"
+          extract_patches "$GITHUB_WORKSPACE/openola_list.txt" \
+                          "$GITHUB_WORKSPACE/patches/openola"
+        fi
+
+        # ── BPF 5.15 ──
+        if [ "${{ inputs.apply_bpf }}" = "true" ]; then
+          grep -iE "bpf|ebpf|5\.15.*bpf|bpf.*5\.15|netbpf|bpf_jit|bpf_verif|bpf_helper|bpf_map|bpf_prog|bpf_syscall|cgroup.*bpf|libbpf" \
+            $GITHUB_WORKSPACE/new_commits.txt > $GITHUB_WORKSPACE/bpf_list.txt || true
+          echo "BPF commits: $(wc -l < $GITHUB_WORKSPACE/bpf_list.txt)"
+          extract_patches "$GITHUB_WORKSPACE/bpf_list.txt" \
+                          "$GITHUB_WORKSPACE/patches/bpf"
+        fi
+
+    # ─────────────────────────────────────────────
+    # 5. APPLY PATCHES TO A31
+    # ─────────────────────────────────────────────
+    - name: Apply OpenELA patches
+      if: ${{ inputs.apply_openola == true }}
+      run: |
+        cd kernel-a31
+        git config user.email "builder@github.com"
+        git config user.name "A31Builder"
+
+        SUCCESS=0; FAILED=0; SKIPPED=0
+        LOG=$GITHUB_WORKSPACE/patch_log_openola.txt
+        echo "=== OpenELA patch log ===" > $LOG
+
+        apply_one() {
+          local pf=$1
+          local name=$(basename "$pf")
+
+          if git am --3way --ignore-whitespace "$pf" >> $LOG 2>&1; then
+            echo "OK  : $name" >> $LOG; return 0
+          fi
+          git am --abort 2>/dev/null || true
+
+          if patch -p1 --forward --fuzz=5 --ignore-whitespace < "$pf" >> $LOG 2>&1; then
+            git add -A
+            local subject=$(grep "^Subject:" "$pf" | head -1 | sed 's/Subject: //')
+            git commit -m "$subject" >> $LOG 2>&1 || true
+            echo "OK(patch): $name" >> $LOG; return 0
+          fi
+
+          if patch -p1 --reverse --dry-run < "$pf" >> $LOG 2>&1; then
+            echo "SKIP(already applied): $name" >> $LOG; return 0
+          fi
+
+          echo "FAIL: $name" >> $LOG; return 1
+        }
+
+        for pf in $GITHUB_WORKSPACE/patches/openola/*.patch; do
+          [ -f "$pf" ] || continue
+          if apply_one "$pf"; then
+            SUCCESS=$((SUCCESS+1))
+          else
+            FAILED=$((FAILED+1))
+            if [ "${{ inputs.skip_failed }}" = "true" ]; then
+              echo "  → skipping" >> $LOG
+              SKIPPED=$((SKIPPED+1))
+            else
+              exit 1
+            fi
+          fi
+        done
+
+        echo "OpenELA: SUCCESS=$SUCCESS FAILED=$FAILED SKIPPED=$SKIPPED"
+        echo "OpenELA: SUCCESS=$SUCCESS FAILED=$FAILED SKIPPED=$SKIPPED" >> $GITHUB_STEP_SUMMARY
+
+    - name: Apply BPF 5.15 patches
+      if: ${{ inputs.apply_bpf == true }}
+      run: |
+        cd kernel-a31
+        git config user.email "builder@github.com"
+        git config user.name "A31Builder"
+
+        SUCCESS=0; FAILED=0; SKIPPED=0
+        LOG=$GITHUB_WORKSPACE/patch_log_bpf.txt
+        echo "=== BPF 5.15 patch log ===" > $LOG
+
+        apply_one() {
+          local pf=$1
+          local name=$(basename "$pf")
+
+          if git am --3way --ignore-whitespace "$pf" >> $LOG 2>&1; then
+            echo "OK  : $name" >> $LOG; return 0
+          fi
+          git am --abort 2>/dev/null || true
+
+          if patch -p1 --forward --fuzz=5 --ignore-whitespace < "$pf" >> $LOG 2>&1; then
+            git add -A
+            local subject=$(grep "^Subject:" "$pf" | head -1 | sed 's/Subject: //')
+            git commit -m "$subject" >> $LOG 2>&1 || true
+            echo "OK(patch): $name" >> $LOG; return 0
+          fi
+
+          if patch -p1 --reverse --dry-run < "$pf" >> $LOG 2>&1; then
+            echo "SKIP(already applied): $name" >> $LOG; return 0
+          fi
+
+          echo "FAIL: $name" >> $LOG; return 1
+        }
+
+        for pf in $GITHUB_WORKSPACE/patches/bpf/*.patch; do
+          [ -f "$pf" ] || continue
+          if apply_one "$pf"; then
+            SUCCESS=$((SUCCESS+1))
+          else
+            FAILED=$((FAILED+1))
+            if [ "${{ inputs.skip_failed }}" = "true" ]; then
+              echo "  → skipping" >> $LOG
+              SKIPPED=$((SKIPPED+1))
+            else
+              exit 1
+            fi
+          fi
+        done
+
+        echo "BPF: SUCCESS=$SUCCESS FAILED=$FAILED SKIPPED=$SKIPPED"
+        echo "BPF: SUCCESS=$SUCCESS FAILED=$FAILED SKIPPED=$SKIPPED" >> $GITHUB_STEP_SUMMARY
+
+    # ─────────────────────────────────────────────
+    # 6. DETECT DEFCONFIG
+    # ─────────────────────────────────────────────
+    - name: Detect A31 defconfig
+      run: |
+        cd kernel-a31
+        DEFCONFIG=$(ls arch/arm64/configs/ 2>/dev/null | \
+          grep -iE "a31|a315|mt6768|m21|m31" | head -1)
+        if [ -z "$DEFCONFIG" ]; then
+          DEFCONFIG=$(ls arch/arm64/configs/ | head -1)
+        fi
+        echo "Using defconfig: $DEFCONFIG"
+        echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
+
+    # ─────────────────────────────────────────────
+    # 7. BUILD
+    # ─────────────────────────────────────────────
+    - name: Build kernel
+      run: |
+        cd kernel-a31
+        export PATH="${{ env.CLANG_PATH }}:$PATH"
+
+        BUILD_ARGS=(
+          ARCH=arm64
+          SUBARCH=arm64
+          CC=clang
+          LD=ld.lld
+          AR=llvm-ar
+          NM=llvm-nm
+          OBJCOPY=llvm-objcopy
+          OBJDUMP=llvm-objdump
+          STRIP=llvm-strip
+          CLANG_TRIPLE=aarch64-linux-gnu-
+          CROSS_COMPILE=aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          -j$(nproc)
+        )
+
+        make "${BUILD_ARGS[@]}" ${{ env.DEFCONFIG }}
+        make "${BUILD_ARGS[@]}" 2>&1 | tee build.log
+
+        if [ -f arch/arm64/boot/Image.gz-dtb ]; then
+          echo "✅ Build SUCCESS" >> $GITHUB_STEP_SUMMARY
+          echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+          ls -lh arch/arm64/boot/
+        elif [ -f arch/arm64/boot/Image.gz ]; then
+          echo "⚠️ Image.gz built (no dtb)" >> $GITHUB_STEP_SUMMARY
+          echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+        else
+          echo "❌ Build FAILED" >> $GITHUB_STEP_SUMMARY
+          tail -80 build.log >> $GITHUB_STEP_SUMMARY
+          echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+          exit 1
+        fi
+
+    # ─────────────────────────────────────────────
+    # 8. PACKAGE AnyKernel3
+    # ─────────────────────────────────────────────
+    - name: Package with AnyKernel3
+      if: env.BUILD_SUCCESS == 'true'
+      run: |
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+        cp kernel-a31/arch/arm64/boot/Image.gz-dtb ak3/ 2>/dev/null || \
+          cp kernel-a31/arch/arm64/boot/Image.gz ak3/
+        sed -i 's/do.devicecheck=1/do.devicecheck=0/' ak3/anykernel.sh
+        sed -i 's/device.name1=.*/device.name1=a31/' ak3/anykernel.sh
+        cd ak3
+        zip -r9 $GITHUB_WORKSPACE/A31-kernel-OpenELA-BPF515-${{ github.run_number }}.zip \
+          * -x .git\* README.md
+
+    # ─────────────────────────────────────────────
+    # 9. UPLOAD ARTIFACTS
+    # ─────────────────────────────────────────────
+    - name: Upload kernel zip
+      uses: actions/upload-artifact@v4
+      if: env.BUILD_SUCCESS == 'true'
+      with:
+        name: A31-kernel-OpenELA-BPF515-${{ github.run_number }}
+        path: |
+          A31-kernel-*.zip
+          kernel-a31/arch/arm64/boot/Image.gz-dtb
+        retention-days: 30
+
+    - name: Upload logs (always)
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: logs-${{ github.run_number }}
+        path: |
+          patch_log_openola.txt
+          patch_log_bpf.txt
+          openola_list.txt
+          bpf_list.txt
+          kernel-a31/build.log
+        retention-days: 7
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "| Item | Count |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| OpenELA patches | $(wc -l < openola_list.txt 2>/dev/null || echo 0) |" >> $GITHUB_STEP_SUMMARY
+        echo "| BPF patches | $(wc -l < bpf_list.txt 2>/dev/null || echo 0) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Build result | ${{ env.BUILD_SUCCESS }} |" >> $GITHUB_STEP_SUMMARY
